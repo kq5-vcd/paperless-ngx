@@ -1400,6 +1400,7 @@ class BulkEditSerializer(
             "split",
             "delete_pages",
             "edit_pdf",
+            "remove_password",
         ],
         label="Method",
         write_only=True,
@@ -1475,6 +1476,8 @@ class BulkEditSerializer(
             return bulk_edit.delete_pages
         elif method == "edit_pdf":
             return bulk_edit.edit_pdf
+        elif method == "remove_password":
+            return bulk_edit.remove_password
         else:  # pragma: no cover
             # This will never happen as it is handled by the ChoiceField
             raise serializers.ValidationError("Unsupported method.")
@@ -1671,6 +1674,12 @@ class BulkEditSerializer(
                         f"Page {op['page']} is out of bounds for document with {doc.page_count} pages.",
                     )
 
+    def validate_parameters_remove_password(self, parameters):
+        if "password" not in parameters:
+            raise serializers.ValidationError("password not specified")
+        if not isinstance(parameters["password"], str):
+            raise serializers.ValidationError("password must be a string")
+
     def validate(self, attrs):
         method = attrs["method"]
         parameters = attrs["parameters"]
@@ -1711,6 +1720,8 @@ class BulkEditSerializer(
                     "Edit PDF method only supports one document",
                 )
             self._validate_parameters_edit_pdf(parameters, attrs["documents"][0])
+        elif method == bulk_edit.remove_password:
+            self.validate_parameters_remove_password(parameters)
 
         return attrs
 
