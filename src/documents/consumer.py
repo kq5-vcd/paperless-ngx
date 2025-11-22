@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING
 
 import magic
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from filelock import FileLock
+from guardian.shortcuts import get_users_with_perms
 from rest_framework.reverse import reverse
 
 from documents.classifier import load_classifier
@@ -775,29 +777,72 @@ class ConsumerPreflightPlugin(
                 f"Cannot consume {self.input_doc.original_file}: File not found.",
             )
 
+    # def pre_check_duplicate(self):
+    #     """
+    #     Using the MD5 of the file, check this exact file doesn't already exist
+    #     """
+    #     with Path(self.input_doc.original_file).open("rb") as f:
+    #         checksum = hashlib.md5(f.read()).hexdigest()
+    #     existing_doc = Document.global_objects.filter(
+    #         Q(checksum=checksum) | Q(archive_checksum=checksum),
+    #     )
+    #
+    #     if existing_doc.exists():
+    #         msg = ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS
+    #         log_msg = f"Not consuming {self.filename}: It is a duplicate of {existing_doc.get().title} (#{existing_doc.get().pk})."
+    #
+    #         if existing_doc.first().deleted_at is not None:
+    #             msg = ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS_IN_TRASH
+    #             log_msg += " Note: existing document is in the trash."
+    #
+    #         if settings.CONSUMER_DELETE_DUPLICATES:
+    #             Path(self.input_doc.original_file).unlink()
+    #         self._fail(
+    #             msg,
+    #             log_msg,
+    #         )
+
     def pre_check_duplicate(self):
         """
-        Using the MD5 of the file, check this exact file doesn't already exist
+        Using the MD5 of the file, check if this exact file already exists.
+        Privacy fix:
+        - If a duplicate exists BUT the uploading user is not allowed to view it,
+          do NOT treat it as a duplicate. Continue normal ingestion.
         """
         with Path(self.input_doc.original_file).open("rb") as f:
             checksum = hashlib.md5(f.read()).hexdigest()
-        existing_doc = Document.global_objects.filter(
+        existing_docs = Document.global_objects.filter(
             Q(checksum=checksum) | Q(archive_checksum=checksum),
         )
-        if existing_doc.exists():
-            msg = ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS
-            log_msg = f"Not consuming {self.filename}: It is a duplicate of {existing_doc.get().title} (#{existing_doc.get().pk})."
+        if not existing_docs.exists():
+            return
+        existing = existing_docs.first()
 
-            if existing_doc.first().deleted_at is not None:
-                msg = ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS_IN_TRASH
-                log_msg += " Note: existing document is in the trash."
+        User = get_user_model()  # determine who uploaded the file
+        uploader = User.objects.get(pk=self.metadata.owner_id)
 
-            if settings.CONSUMER_DELETE_DUPLICATES:
-                Path(self.input_doc.original_file).unlink()
-            self._fail(
-                msg,
-                log_msg,
-            )
+        allowed_users = get_users_with_perms(
+            existing,
+            only_with_perms_in=["view_document"],
+        )  # determine who is allowed to view THAT existing document
+
+        # fix
+        if uploader not in allowed_users:
+            # continue normal ingestion: NO fail, NO message, NO deletion.
+            return
+
+        # original duplicate behavior (safe because user has permission)
+        msg = ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS
+        log_msg = f"Not consuming {self.filename}: It is a duplicate of {existing.title} (#{existing.pk})."
+
+        if existing.deleted_at is not None:
+            msg = ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS_IN_TRASH
+            log_msg += " Note: existing document is in the trash."
+
+        if settings.CONSUMER_DELETE_DUPLICATES:
+            Path(self.input_doc.original_file).unlink()
+
+        self._fail(msg, log_msg)
 
     def pre_check_directories(self):
         """
