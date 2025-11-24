@@ -28,6 +28,18 @@ from documents.models import Document
 from documents.models import MatchingModel
 
 import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.preprocessing import MultiLabelBinarizer
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+try:
+    from opacus import PrivacyEngine
+except Exception as e:
+    PrivacyEngine = None
 
 logger = logging.getLogger("paperless.classifier")
 
@@ -284,19 +296,6 @@ class DocumentClassifier:
             f"{docs_queryset.count()} documents, {num_tags} tag(s), {num_correspondents} correspondent(s), "
             f"{num_document_types} document type(s). {num_storage_paths} storage path(s)",
         )
-
-        from sklearn.feature_extraction.text import CountVectorizer
-        from sklearn.neural_network import MLPClassifier
-        from sklearn.preprocessing import LabelBinarizer
-        from sklearn.preprocessing import MultiLabelBinarizer
-        import torch
-        import torch.nn as nn
-        import torch.optim as optim
-
-        try:
-            from opacus import PrivacyEngine
-        except Exception as e:
-            PrivacyEngine = None
 
         # Step 2: vectorize data
         logger.debug("Vectorizing data...")
