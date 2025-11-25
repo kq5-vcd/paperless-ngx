@@ -1,14 +1,15 @@
 import unittest
 import numpy as np
 import pytest
-from classifier_carol import _train_with_dp_torch
+from documents.classifier import _train_with_dp_torch
 
-class MyTestCase(unittest.TestCase):
-   """ def test_dp_training_reports_metadata(self):
+class DPSGDTest(unittest.TestCase):
+    def test_dp_training_reports_metadata(self):
         # Tiny synthetic dataset
         X = np.random.rand(10, 5).astype(np.float32)  # 10 samples, 5 features
         y = np.random.randint(0, 2, size=(10,))  # binary labels
-
+        print("This is X: ", X)
+        print("This is y: ", y)
         # Train with DP
         result = _train_with_dp_torch(
             X, y,
@@ -17,6 +18,7 @@ class MyTestCase(unittest.TestCase):
             noise_multiplier=1.5, max_grad_norm=1.0,
             verbose=False
         )
+        print("I already have a result: ", result)
 
         self.assertIsInstance(result, dict)
         self.assertIn("noise_multiplier", result)
@@ -25,6 +27,7 @@ class MyTestCase(unittest.TestCase):
         self.assertIn("delta", result)  # delta is returned in your code
         self.assertIn("epsilon", result)
         self.assertGreater(result["epsilon"], 0)
+        self.assertLess(result["epsilon"], 20)
 
         # Optional: check model exists
         self.assertIn("model", result)
@@ -36,4 +39,3 @@ class MyTestCase(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-"""
