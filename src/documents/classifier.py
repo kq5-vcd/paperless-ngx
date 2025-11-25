@@ -27,6 +27,20 @@ from documents.caching import StoredLRUCache
 from documents.models import Document
 from documents.models import MatchingModel
 
+import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.preprocessing import MultiLabelBinarizer
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+try:
+    from opacus import PrivacyEngine
+except Exception as e:
+    PrivacyEngine = None
+
 logger = logging.getLogger("paperless.classifier")
 
 ADVANCED_TEXT_PROCESSING_ENABLED = (
@@ -95,8 +109,8 @@ def load_classifier(*, raise_exception: bool = False) -> DocumentClassifier | No
 class DocumentClassifier:
     # v7 - Updated scikit-learn package version
     # v8 - Added storage path classifier
-    # v9 - Changed from hashing to time/ids for re-train check
-    FORMAT_VERSION = 9
+    # v10 - Implemented Differential Privacy for Stochastic Gradient Descent (DP-SGD)
+    FORMAT_VERSION = 10
 
     def __init__(self) -> None:
         # last time a document changed and therefore training might be required
@@ -283,11 +297,6 @@ class DocumentClassifier:
             f"{num_document_types} document type(s). {num_storage_paths} storage path(s)",
         )
 
-        from sklearn.feature_extraction.text import CountVectorizer
-        from sklearn.neural_network import MLPClassifier
-        from sklearn.preprocessing import LabelBinarizer
-        from sklearn.preprocessing import MultiLabelBinarizer
-
         # Step 2: vectorize data
         logger.debug("Vectorizing data...")
 
@@ -306,7 +315,7 @@ class DocumentClassifier:
 
         data_vectorized: ndarray = self.data_vectorizer.fit_transform(
             content_generator(),
-        )
+        ) # if vocab > ~50k this may be heavy for SGD
 
         # See the notes here:
         # https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.CountVectorizer.html
@@ -314,6 +323,16 @@ class DocumentClassifier:
         self.data_vectorizer.stop_words_ = None
 
         # Step 3: train the classifiers
+        # DP-SGD needs per-sample gradients; Opacus automates this but requires converting
+        # sparse bag-of-words to dense tensors (or using embedding tricks). For moderate
+        # vocab sizes this is fine; for very large vocab you may need dimensionality
+        # reduction (SVD, hashing) before DP training.
+        use_dp = True  # or get from config
+        dp_params = dict(
+            hidden_sizes=(512,), epochs=15, batch_size=64, lr=1e-3,
+            max_grad_norm=1.0, noise_multiplier=1.1, verbose=True
+        )
+
         if num_tags > 0:
             logger.debug("Training tags classifier...")
 
@@ -331,16 +350,39 @@ class DocumentClassifier:
                 self.tags_binarizer = MultiLabelBinarizer()
                 labels_tags_vectorized = self.tags_binarizer.fit_transform(labels_tags)
 
-            self.tags_classifier = MLPClassifier(tol=0.01)
-            self.tags_classifier.fit(data_vectorized, labels_tags_vectorized)
+            if use_dp:
+                # DP-SGD
+                dp_result = _train_with_dp_torch(
+                    data_vectorized,
+                    labels_tags if num_tags != 1 else labels_tags_vectorized,
+                    multi_label=(num_tags != 1),
+                    **dp_params,
+                )
+                self.tags_classifier = dp_result  # store dict for DP
+            else:
+                # sklearning training
+                self.tags_classifier = MLPClassifier(tol=0.01)
+                self.tags_classifier.fit(data_vectorized, labels_tags_vectorized)
         else:
             self.tags_classifier = None
             logger.debug("There are no tags. Not training tags classifier.")
 
         if num_correspondents > 0:
             logger.debug("Training correspondent classifier...")
-            self.correspondent_classifier = MLPClassifier(tol=0.01)
-            self.correspondent_classifier.fit(data_vectorized, labels_correspondent)
+
+            if use_dp:
+                # DP-SGD
+                dp_result = _train_with_dp_torch(
+                    data_vectorized,
+                    labels_correspondent,
+                    multi_label=False,
+                    **dp_params
+                )
+                self.correspondent_classifier = dp_result
+            else:
+                # sklearning training
+                self.correspondent_classifier = MLPClassifier(tol=0.01)
+                self.correspondent_classifier.fit(data_vectorized, labels_correspondent)
         else:
             self.correspondent_classifier = None
             logger.debug(
@@ -349,8 +391,20 @@ class DocumentClassifier:
 
         if num_document_types > 0:
             logger.debug("Training document type classifier...")
-            self.document_type_classifier = MLPClassifier(tol=0.01)
-            self.document_type_classifier.fit(data_vectorized, labels_document_type)
+
+            if use_dp:
+                # DP-SGD
+                dp_result = _train_with_dp_torch(
+                    data_vectorized,
+                    labels_document_type,
+                    multi_label=False,
+                    **dp_params
+                )
+                self.document_type_classifier = dp_result
+            else:
+                # sklearning training
+                self.document_type_classifier = MLPClassifier(tol=0.01)
+                self.document_type_classifier.fit(data_vectorized, labels_document_type)
         else:
             self.document_type_classifier = None
             logger.debug(
@@ -358,14 +412,21 @@ class DocumentClassifier:
             )
 
         if num_storage_paths > 0:
-            logger.debug(
-                "Training storage paths classifier...",
-            )
-            self.storage_path_classifier = MLPClassifier(tol=0.01)
-            self.storage_path_classifier.fit(
-                data_vectorized,
-                labels_storage_path,
-            )
+            logger.debug("Training storage paths classifier...")
+
+            if use_dp:
+                # DP-SGD
+                dp_result = _train_with_dp_torch(
+                    data_vectorized,
+                    labels_storage_path,
+                    multi_label=False,
+                    **dp_params
+                )
+                self.storage_path_classifier = dp_result
+            else:
+                # sklearning training
+                self.storage_path_classifier = MLPClassifier(tol=0.01)
+                self.storage_path_classifier.fit(data_vectorized,labels_storage_path)
         else:
             self.storage_path_classifier = None
             logger.debug(
@@ -494,7 +555,11 @@ class DocumentClassifier:
     def predict_correspondent(self, content: str) -> int | None:
         if self.correspondent_classifier:
             X = self._vectorize(content)
-            correspondent_id = self.correspondent_classifier.predict(X)
+            if isinstance(self.correspondent_classifier, dict):
+                preds = _dp_predict(self.correspondent_classifier, X)
+                correspondent_id = preds[0]
+            else:
+                correspondent_id = self.correspondent_classifier.predict(X)[0]
             if correspondent_id != -1:
                 return correspondent_id
             else:
@@ -505,9 +570,28 @@ class DocumentClassifier:
     def predict_document_type(self, content: str) -> int | None:
         if self.document_type_classifier:
             X = self._vectorize(content)
-            document_type_id = self.document_type_classifier.predict(X)
+            if isinstance(self.document_type_classifier, dict):
+                preds = _dp_predict(self.document_type_classifier, X)
+                document_type_id = preds[0]
+            else:
+                document_type_id = self.document_type_classifier.predict(X)[0]
             if document_type_id != -1:
                 return document_type_id
+            else:
+                return None
+        else:
+            return None
+
+    def predict_storage_path(self, content: str) -> int | None:
+        if self.storage_path_classifier:
+            X = self._vectorize(content)
+            if isinstance(self.storage_path_classifier, dict):
+                preds = _dp_predict(self.storage_path_classifier, X)
+                storage_path_id = preds[0]
+            else:
+                storage_path_id = self.storage_path_classifier.predict(X)[0]
+            if storage_path_id != -1:
+                return storage_path_id
             else:
                 return None
         else:
@@ -518,29 +602,211 @@ class DocumentClassifier:
 
         if self.tags_classifier:
             X = self._vectorize(content)
-            y = self.tags_classifier.predict(X)
-            tags_ids = self.tags_binarizer.inverse_transform(y)[0]
-            if type_of_target(y).startswith("multilabel"):
-                # the usual case when there are multiple tags.
-                return list(tags_ids)
-            elif type_of_target(y) == "binary" and tags_ids != -1:
-                # This is for when we have binary classification with only one
-                # tag and the result is to assign this tag.
-                return [tags_ids]
+            if isinstance(self.tags_classifier, dict):
+                tags_list = _dp_predict(self.tags_classifier, X)[0]
+                return list(tags_list)
             else:
-                # Usually binary as well with -1 as the result, but we're
-                # going to catch everything else here as well.
-                return []
+                y = self.tags_classifier.predict(X)
+                tags_ids = self.tags_binarizer.inverse_transform(y)[0]
+                if type_of_target(y).startswith("multilabel"):
+                    return list(tags_ids)
+                elif type_of_target(y) == "binary" and tags_ids != -1:
+                    return [tags_ids]
+                else:
+                    return []
         else:
             return []
 
-    def predict_storage_path(self, content: str) -> int | None:
-        if self.storage_path_classifier:
-            X = self._vectorize(content)
-            storage_path_id = self.storage_path_classifier.predict(X)
-            if storage_path_id != -1:
-                return storage_path_id
-            else:
-                return None
+
+# Helper small MLP
+class SmallMLP(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_sizes=(512,)):
+        super().__init__()
+        layers = []
+        prev = input_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.ReLU())
+            prev = h
+        layers.append(nn.Linear(prev, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+# DP training helper
+def _train_with_dp_torch(
+    X_sparse,  # scipy sparse matrix (N x D)
+    y,
+    *,
+    multi_label=False,
+    hidden_sizes=(512,),
+    epochs=10,
+    batch_size=64, # Smaller batch_size increases privacy accounting sample rate; Opacus requires that sample_rate = batch_size / N be consistent
+    lr=1e-3,
+    max_grad_norm=1.0, # gradient clipping
+    noise_multiplier=2, # more privacy (smaller ε) but worse accuracy
+    delta=None,
+    verbose=False,
+    device=None,
+):
+    """
+    Trains a PyTorch MLP with DP-SGD (Opacus) and returns a dict with:
+     - model: trained nn.Module
+     - label_map: mapping original label -> class index (for single-label)
+     - inv_label_map: reverse mapping
+     - is_multi_label: bool
+     - threshold (for multi-label inference): 0.5 default (you may tune)
+     converts the sparse data_vectorized to a dense float32 tensor,
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if PrivacyEngine is None:
+        raise RuntimeError(
+            "Opacus not available. Install with `pip install opacus` to use DP training."
+        )
+
+    # Convert X to dense (float32). If X is sparse, densify carefully.
+    if hasattr(X_sparse, "toarray"):
+        X = X_sparse.toarray().astype(np.float32)
+    else:
+        X = np.asarray(X_sparse, dtype=np.float32)
+
+    N, D = X.shape
+    X_tensor = torch.from_numpy(X).to(device)
+
+    # Prepare targets
+    if multi_label:
+        # y should be a binary matrix (N x C); if currently list-of-lists, convert
+        if isinstance(y, (list, tuple)) and (len(y) == N and not isinstance(y[0], (np.ndarray, list))):
+            # list of lists of labels -> MultiLabelBinarizer style conversion
+            # Build global label set
+            all_labels = sorted({lab for row in y for lab in row})
+            label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
+            C = len(all_labels)
+            y_mat = np.zeros((N, C), dtype=np.float32)
+            for i, row in enumerate(y):
+                for lab in row:
+                    y_mat[i, label_to_idx[lab]] = 1.0
+            y_tensor = torch.from_numpy(y_mat).to(device)
+            label_map = label_to_idx
+            inv_label_map = {v: k for k, v in label_map.items()}
+        elif isinstance(y, np.ndarray) and y.ndim == 2:
+            y_tensor = torch.from_numpy(y.astype(np.float32)).to(device)
+            C = y_tensor.shape[1]
+            label_map = None
+            inv_label_map = None
         else:
-            return None
+            raise ValueError("Unsupported multi_label y format")
+    else:
+        # single-label (including -1). Map unique labels to dense indices.
+        unique = sorted(set(int(v) for v in y))
+        label_map = {lab: i for i, lab in enumerate(unique)}
+        inv_label_map = {i: lab for lab, i in label_map.items()}
+        y_idx = np.array([label_map[int(v)] for v in y], dtype=np.int64)
+        y_tensor = torch.from_numpy(y_idx).to(device)
+
+    # Build model and loss
+    if multi_label:
+        C = y_tensor.shape[1]
+        model = SmallMLP(D, C, hidden_sizes=hidden_sizes).to(device)
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        C = len(inv_label_map)
+        model = SmallMLP(D, C, hidden_sizes=hidden_sizes).to(device)
+        criterion = nn.CrossEntropyLoss()
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Setup Opacus PrivacyEngine
+    # If delta not set, use 1 / (N ** 1.1) as heuristic (you can set it externally)
+    if delta is None:
+        delta = 1.0 / (N ** 1.1)
+
+    privacy_engine = PrivacyEngine()
+    model, optimizer, dataloader = None, None, None
+
+    # Build a DataLoader for per-sample gradients: we must pass sample_rate or batch_size.
+    from torch.utils.data import TensorDataset, DataLoader
+
+    dataset = TensorDataset(X_tensor, y_tensor)
+    sample_rate = float(batch_size) / float(N)
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    # Recreate model/optimizer now that dataset exists
+    model = SmallMLP(D, C, hidden_sizes=hidden_sizes).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Attach privacy engine
+    privacy_engine = PrivacyEngine()
+    model, optimizer, loader = privacy_engine.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
+    )
+
+    # Training loop
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad()
+            outputs = model(xb)
+            if multi_label:
+                loss = criterion(outputs, yb)
+            else:
+                loss = criterion(outputs, yb.squeeze().long())
+            loss.backward()
+            optimizer.step()
+            running_loss += float(loss.detach().cpu().item())
+        if verbose:
+            # Get current epsilon spent
+            epsilon = privacy_engine.get_epsilon(delta)
+            print(f"Epoch {epoch+1}/{epochs} loss={running_loss:.4f} eps≈{epsilon:.2f}")
+
+    epsilon = privacy_engine.get_epsilon(delta)
+    res = {
+        "model": model.cpu(),  # move model to cpu for storage/usage
+        "label_map": label_map,
+        "inv_label_map": inv_label_map,
+        "is_multi_label": multi_label,
+        "threshold": 0.5,
+        "noise_multiplier": noise_multiplier,
+        "max_grad_norm": max_grad_norm,
+        "delta": delta,
+        "epsilon": epsilon,
+    }
+    return res
+
+# Utility: inference helper for the returned dict
+def _dp_predict(result_dict, X_sparse, device=None):
+    model = result_dict["model"]
+    model.eval()
+    if hasattr(X_sparse, "toarray"):
+        X = X_sparse.toarray().astype(np.float32)
+    else:
+        X = np.asarray(X_sparse, dtype=np.float32)
+    xb = torch.from_numpy(X)
+    with torch.no_grad():
+        out = model(xb)
+    if result_dict["is_multi_label"]:
+        logits = out.numpy()
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        chosen = (probs >= result_dict.get("threshold", 0.5))
+        # map back indices to labels
+        inv = result_dict["inv_label_map"]
+        results = []
+        for row in chosen:
+            labels = [inv[i] for i, v in enumerate(row) if v]
+            results.append(labels)
+        return results
+    else:
+        preds = out.argmax(dim=1).numpy()
+        inv = result_dict["inv_label_map"]
+        return [inv[int(p)] for p in preds]
