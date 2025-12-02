@@ -1,24 +1,30 @@
 import unittest
+
 import numpy as np
-import pytest
+
 from documents.classifier import _train_with_dp_torch
+
 
 class DPSGDTest(unittest.TestCase):
     def test_dp_training_reports_metadata(self):
         # Tiny synthetic dataset
         X = np.random.rand(10, 5).astype(np.float32)  # 10 samples, 5 features
         y = np.random.randint(0, 2, size=(10,))  # binary labels
-        print("This is X: ", X)
-        print("This is y: ", y)
+        # print("This is X: ", X)
+        # print("This is y: ", y)
         # Train with DP
         result = _train_with_dp_torch(
-            X, y,
+            X,
+            y,
             multi_label=False,
-            epochs=1, batch_size=4, lr=1e-3,
-            noise_multiplier=1.5, max_grad_norm=1.0,
-            verbose=False
+            epochs=1,
+            batch_size=4,
+            lr=1e-3,
+            noise_multiplier=1.5,
+            max_grad_norm=1.0,
+            verbose=False,
         )
-        print("I already have a result: ", result)
+        # print("I already have a result: ", result)
 
         self.assertIsInstance(result, dict)
         self.assertIn("noise_multiplier", result)
@@ -37,5 +43,6 @@ class DPSGDTest(unittest.TestCase):
         # result_high_noise = _train_with_dp_torch(X, y, noise_multiplier=2.0, epochs=1)
         # assert result_high_noise["noise_multiplier"] > result_low_noise["noise_multiplier"]
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()
