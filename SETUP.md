@@ -51,7 +51,7 @@ file via `PAPERLESS_DEBUG=true`.
 Create consume and media directories:
 
 ```bash
-$ mkdir -p consume media
+$ mkdir -p consume media data trash static
 $ uv sync --group dev
 $ uv run pre-commit install
 ```
