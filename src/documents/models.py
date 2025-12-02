@@ -212,8 +212,7 @@ class Document(SoftDeleteModel, ModelWithOwner):
         _("checksum"),
         max_length=32,
         editable=False,
-        # unique=True,
-        db_index=True,
+        unique=True,
         help_text=_("The checksum of the original document."),
     )
 
@@ -718,11 +717,17 @@ class Note(SoftDeleteModel):
         return self.note
 
 
-class ShareLink(SoftDeleteModel):
+class ShareLink(
+    SoftDeleteModel,
+):  # The ShareLink model represents a shareable link for a document. (SoftDeleteModel allows soft deletion of share links.)
     class FileVersion(models.TextChoices):
         ARCHIVE = ("archive", _("Archive"))
         ORIGINAL = ("original", _("Original"))
 
+    ### --- Fields of the Share Link model --- ###
+    # These fields define the properties of a share link for a document.
+
+    ### --- The date the share link was created --- ###
     created = models.DateTimeField(
         _("created"),
         default=timezone.now,
@@ -731,12 +736,57 @@ class ShareLink(SoftDeleteModel):
         editable=False,
     )
 
+    ### --- The expiration date of the share link --- ###
     expiration = models.DateTimeField(
-        _("expiration"),
-        blank=True,
-        null=True,
-        db_index=True,
+        _("expiration"),  # Field label
+        blank=True,  # Allow blank values --> no expiration
+        null=True,  # Allow null values --> no expiration
+        db_index=True,  # Index for faster queries
+        help_text=_(
+            "The date and time when the share link will expire.",
+        ),  # Help text --> explains the field purpose
     )
+
+    # /* --- Start added code --- */
+    access_count = models.PositiveIntegerField(
+        _("access count"),  # Field label
+        default=0,  # Default value is 0
+        editable=False,  # Not editable by users --> managed automatically by the system
+        db_index=True,  # Index for faster queries
+        help_text=_(
+            "The number of times the share link has been accessed.",
+        ),  # Help text --> explains the field purpose
+    )
+
+    max_access_count = models.PositiveIntegerField(
+        _("access count limit"),  # Field label
+        blank=True,  # Allow blank values --> no limit
+        null=True,  # Allow null values --> no limit
+        db_index=True,  # Index for faster queries
+        help_text=_(
+            "The maximum number of times the share link can be accessed.",
+        ),  # Help text --> explains the field purpose
+    )
+
+    password_hash = models.CharField(
+        _("password hash"),  # Field label
+        max_length=128,  # Maximum length of the hash
+        blank=True,  # Allow blank values --> no password protection
+        null=True,  # Allow null values --> no password protection
+        editable=False,  # Not editable by users --> managed automatically by the system
+        help_text=_(
+            "The hashed password required to access the share link.",
+        ),  # Help text --> explains the field purpose
+    )
+
+    protect_link_with_password = models.BooleanField(
+        _("password protection"),  # Field label
+        default=False,  # Default value is False --> no password protection
+        help_text=_(
+            "Determines whether the share link is protected with a password.",
+        ),  # Help text --> explains the field purpose
+    )
+    # /* --- End added code --- */
 
     slug = models.SlugField(
         _("slug"),
