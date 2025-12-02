@@ -6,6 +6,7 @@ import re
 import tempfile
 import zipfile
 from collections import defaultdict
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from time import mktime
@@ -19,9 +20,13 @@ import magic
 import pathvalidate
 from celery import states
 from django.conf import settings
+
+# ADDED IMPORT for the password verification needed for ShareLink access
+from django.contrib.auth.hashers import check_password
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.db import connections
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
@@ -44,6 +49,7 @@ from django.http import HttpResponseForbidden
 from django.http import HttpResponseRedirect
 from django.http import HttpResponseServerError
 from django.shortcuts import get_object_or_404
+from django.shortcuts import render
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.utils.timezone import make_aware
@@ -69,6 +75,7 @@ from rest_framework import parsers
 from rest_framework import serializers
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import ValidationError
 from rest_framework.filters import OrderingFilter
 from rest_framework.filters import SearchFilter
 from rest_framework.generics import GenericAPIView
@@ -105,6 +112,7 @@ from documents.conditionals import thumbnail_last_modified
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.data_models import DocumentSource
+from documents.file_handling import format_filename
 from documents.filters import CorrespondentFilterSet
 from documents.filters import CustomFieldFilterSet
 from documents.filters import DocumentFilterSet
@@ -116,6 +124,7 @@ from documents.filters import PaperlessTaskFilterSet
 from documents.filters import ShareLinkFilterSet
 from documents.filters import StoragePathFilterSet
 from documents.filters import TagFilterSet
+from documents.mail import EmailAttachment
 from documents.mail import send_email
 from documents.matching import match_correspondents
 from documents.matching import match_document_types
@@ -180,7 +189,6 @@ from documents.tasks import index_optimize
 from documents.tasks import sanity_check
 from documents.tasks import train_classifier
 from documents.tasks import update_document_parent_tags
-from documents.templating.filepath import validate_filepath_template_and_render
 from documents.utils import get_boolean
 from paperless import version
 from paperless.celery import app as celery_app
@@ -638,6 +646,18 @@ class EmailDocumentDetailSchema(EmailSerializer):
                         "id": {"type": "integer"},
                         "created": {"type": "string", "format": "date-time"},
                         "expiration": {"type": "string", "format": "date-time"},
+                        "access_count": {
+                            "type": "integer",
+                        },  # Number of times the link has been accessed (ADDED HERE)
+                        "max_access_count": {
+                            "type": "integer",
+                        },  # Maximum allowed accesses for the link (ADDED HERE)
+                        "protect_link_with_password": {
+                            "type": "boolean",
+                        },  # Whether the link is protected with a password (ADDED HERE)
+                        "password_hash": {
+                            "type": "string",
+                        },  # Hashed password for the link (ADDED HERE)
                         "slug": {"type": "string"},
                     },
                 },
@@ -1103,12 +1123,22 @@ class DocumentViewSet(
         if request.method == "GET":
             now = timezone.now()
             links = (
-                ShareLink.objects.filter(document=doc)
-                .only("pk", "created", "expiration", "slug")
-                .exclude(expiration__lt=now)
-                .order_by("-created")
+                ShareLink.objects.filter(
+                    document=doc,
+                )  # Filter share links for this document (uses the ShareLinkFilterSet class in filters.py line 787)
+                .only(
+                    "pk",
+                    "created",
+                    "expiration",
+                    "slug",
+                )  # Optimize query by only selecting needed fields (ADD access_count)
+                .exclude(expiration__lt=now)  # Exclude expired links
+                .order_by("-created")  # Order by creation date descending
             )
-            serializer = ShareLinkSerializer(links, many=True)
+            serializer = ShareLinkSerializer(
+                links,
+                many=True,
+            )  # Serialize the share links
             return Response(serializer.data)
 
     @action(methods=["get"], detail=True, name="Audit Trail", filter_backends=[])
@@ -1213,12 +1243,28 @@ class DocumentViewSet(
                 return HttpResponseForbidden("Insufficient permissions")
 
         try:
+            attachments: list[EmailAttachment] = []
+            for doc in documents:
+                attachment_path = (
+                    doc.archive_path
+                    if use_archive_version and doc.has_archive_version
+                    else doc.source_path
+                )
+                attachments.append(
+                    EmailAttachment(
+                        path=attachment_path,
+                        mime_type=doc.mime_type,
+                        friendly_name=doc.get_public_filename(
+                            archive=use_archive_version and doc.has_archive_version,
+                        ),
+                    ),
+                )
+
             send_email(
                 subject=subject,
                 body=message,
                 to=addresses,
-                attachments=documents,
-                use_archive=use_archive_version,
+                attachments=attachments,
             )
 
             logger.debug(
@@ -1362,6 +1408,13 @@ class UnifiedSearchViewSet(DocumentViewSet):
                 type=OpenApiTypes.STR,
                 location=OpenApiParameter.PATH,
             ),
+            OpenApiParameter(
+                name="limit",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description="Return only the last N entries from the log file",
+                required=False,
+            ),
         ],
         responses={
             (200, "application/json"): serializers.ListSerializer(
@@ -1393,8 +1446,22 @@ class LogViewSet(ViewSet):
         if not log_file.is_file():
             raise Http404
 
+        limit_param = request.query_params.get("limit")
+        if limit_param is not None:
+            try:
+                limit = int(limit_param)
+            except (TypeError, ValueError):
+                raise ValidationError({"limit": "Must be a positive integer"})
+            if limit < 1:
+                raise ValidationError({"limit": "Must be a positive integer"})
+        else:
+            limit = None
+
         with log_file.open() as f:
-            lines = [line.rstrip() for line in f.readlines()]
+            if limit is None:
+                lines = [line.rstrip() for line in f.readlines()]
+            else:
+                lines = [line.rstrip() for line in deque(f, maxlen=limit)]
 
         return Response(lines)
 
@@ -1839,7 +1906,7 @@ class SearchAutoCompleteView(GenericAPIView):
         user = self.request.user if hasattr(self.request, "user") else None
 
         if "term" in request.query_params:
-            term = request.query_params["term"]
+            term = request.query_params["term"].strip()
         else:
             return HttpResponseBadRequest("Term required")
 
@@ -2312,7 +2379,7 @@ class StoragePathViewSet(ModelViewSet, PermissionsAwareDocumentCountMixin):
         document = serializer.validated_data.get("document")
         path = serializer.validated_data.get("path")
 
-        result = validate_filepath_template_and_render(path, document)
+        result = format_filename(document, path)
         return Response(result)
 
 
@@ -2411,31 +2478,34 @@ class UiSettingsView(GenericAPIView):
     ),
 )
 class RemoteVersionView(GenericAPIView):
+    cache_key = "remote_version_view_latest_release"
+
     def get(self, request, format=None):
-        remote_version = "0.0.0"
-        is_greater_than_current = False
         current_version = packaging_version.parse(version.__full_version_str__)
-        try:
-            resp = httpx.get(
-                "https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest",
-                headers={"Accept": "application/json"},
-            )
-            resp.raise_for_status()
+        remote_version = cache.get(self.cache_key)
+        if remote_version is None:
             try:
+                resp = httpx.get(
+                    "https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest",
+                    headers={"Accept": "application/json"},
+                )
+                resp.raise_for_status()
                 data = resp.json()
                 remote_version = data["tag_name"]
                 # Some early tags used ngx-x.y.z
                 remote_version = remote_version.removeprefix("ngx-")
             except ValueError as e:
                 logger.debug(f"An error occurred parsing remote version json: {e}")
-        except httpx.HTTPError as e:
-            logger.debug(f"An error occurred checking for available updates: {e}")
+            except httpx.HTTPError as e:
+                logger.debug(f"An error occurred checking for available updates: {e}")
+
+            if remote_version:
+                cache.set(self.cache_key, remote_version, 60 * 15)
+            else:
+                remote_version = "0.0.0"
 
         is_greater_than_current = (
-            packaging_version.parse(
-                remote_version,
-            )
-            > current_version
+            packaging_version.parse(remote_version) > current_version
         )
 
         return Response(
@@ -2568,19 +2638,114 @@ class ShareLinkViewSet(ModelViewSet, PassUserMixin):
         ObjectOwnedOrGrantedPermissionsFilter,
     )
     filterset_class = ShareLinkFilterSet
-    ordering_fields = ("created", "expiration", "document")
+    ordering_fields = (
+        "created",
+        "expiration",
+        "document",
+    )  # ADD access_count to ordering fields
+
+
+# """ Old version of SharedLinkView for reference
+# class SharedLinkView(View):
+#     authentication_classes = []
+#     permission_classes = []
+#
+#     def get(self, request, slug):
+#         share_link = ShareLink.objects.filter(slug=slug).first()
+#         if share_link is None:
+#             return HttpResponseRedirect("/accounts/login/?sharelink_notfound=1")
+#         if share_link.expiration is not None and share_link.expiration < timezone.now():
+#             return HttpResponseRedirect("/accounts/login/?sharelink_expired=1")
+#         return serve_file(
+#             doc=share_link.document,
+#             use_archive=share_link.file_version == "archive",
+#             disposition="inline",
+#         )"""
 
 
 class SharedLinkView(View):
+    """View to handle accessing shared links."""
+
+    # This view handles GET requests to access documents via share links.
     authentication_classes = []
     permission_classes = []
 
     def get(self, request, slug):
+        """
+        Handle GET request to access a document via a share link.
+        :param request: The HTTP request object.
+        :param slug: The unique slug identifying the share link.
+        :return: An HTTP response serving the document or a redirect in case of errors.
+        """
+        ### --- Retrieve share link --- ###
         share_link = ShareLink.objects.filter(slug=slug).first()
+
+        ### --- Check link existence --- ###
         if share_link is None:
             return HttpResponseRedirect("/accounts/login/?sharelink_notfound=1")
+
+        ### --- Check link expiration --- ###
         if share_link.expiration is not None and share_link.expiration < timezone.now():
             return HttpResponseRedirect("/accounts/login/?sharelink_expired=1")
+            # The argument is used to show an appropriate message in the login page --> ?sharelink_expired=1 will show "Share link has expired."
+
+        # /* --- Start added code --- */
+        ### --- Check accesses limit --- ###
+        if (
+            share_link.max_access_count is not None
+            and share_link.access_count >= share_link.max_access_count
+        ):
+            return HttpResponseRedirect("/accounts/login/?sharelink_accesses_reached=1")
+            # An extra block of code has been added in the file templates/paperless-ngx/base.html to provide the following feedback to the user:
+            # "Share link access limit has been reached." when the argument ?sharelink_accesses_reached=1 is present in the URL
+
+        # If a password is set for the share link, redirect to password form
+        if share_link.protect_link_with_password:
+            return render(
+                request,
+                "paperless-ngx/enter_password.html",
+                {"slug": slug},
+            )  # Render password entry template
+
+        # If all checks passed, increment the access count
+        share_link.access_count += 1
+        share_link.save()
+        # /* --- End added code --- */
+
+        ### --- Serve file --- ###
+        return serve_file(
+            doc=share_link.document,
+            use_archive=share_link.file_version == "archive",
+            disposition="inline",
+        )
+
+    def post(self, request, slug):
+        """
+        Handle POST request to access a document via a share link with password protection.
+        :param request: The HTTP request object.
+        :param slug: The unique slug identifying the share link.
+        :return: An HTTP response serving the document or a redirect in case of errors.
+        """
+        ### --- Retrieve share link --- ###
+        share_link = ShareLink.objects.filter(slug=slug).first()
+
+        # Perform a password check
+        password_provided = request.POST.get(
+            "sharelink_password",
+            "",
+        )  # Get password from POST data
+        if (password_provided is None) or (
+            not check_password(password_provided, share_link.password_hash)
+        ):
+            return HttpResponseRedirect(
+                "/accounts/login/?incorrect_sharelink_password=1",
+            )
+
+        # If the password is correct, increment the access count
+        share_link.access_count += 1
+        share_link.save()
+
+        ### --- Serve file --- ###
         return serve_file(
             doc=share_link.document,
             use_archive=share_link.file_version == "archive",

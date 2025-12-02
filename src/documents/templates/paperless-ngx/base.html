@@ -61,6 +61,14 @@
                     <div class="alert alert-danger" role="alert">
                     {% translate "Share link has expired." %}
                     </div>
+				{% elif request.GET.sharelink_accesses_reached %}
+					<div class="alert alert-danger" role="alert">
+					{% translate "Share link access limit has been reached." %}
+					</div>
+				{% elif request.GET.incorrect_sharelink_password %}
+					<div class="alert alert-danger" role="alert">
+					{% translate "Incorrect share link password." %}
+					</div>
                 {% endif %}
 
                 {% block form_content %}

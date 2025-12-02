@@ -43,6 +43,9 @@ if settings.AUDIT_LOG_ENABLED:
     from auditlog.context import set_actor
 
 
+# ADDED IMPORT for password hashing
+from django.contrib.auth.hashers import make_password
+
 from documents import bulk_edit
 from documents.data_models import DocumentSource
 from documents.filters import CustomFieldQueryParser
@@ -1041,7 +1044,7 @@ class DocumentSerializer(
             request.version if request else settings.REST_FRAMEWORK["DEFAULT_VERSION"],
         )
 
-        if api_version < 9:
+        if api_version < 9 and "created" in self.fields:
             # provide created as a datetime for backwards compatibility
             from django.utils import timezone
 
@@ -2117,6 +2120,10 @@ class ShareLinkSerializer(OwnedObjectSerializer):
             "id",
             "created",
             "expiration",
+            "access_count",  # ADDED
+            "max_access_count",  # ADDED
+            "protect_link_with_password",  # ADDED
+            "password_hash",  # ADDED
             "slug",
             "document",
             "file_version",
@@ -2124,6 +2131,8 @@ class ShareLinkSerializer(OwnedObjectSerializer):
 
     def create(self, validated_data):
         validated_data["slug"] = get_random_string(50)
+        if validated_data["protect_link_with_password"]:
+            validated_data["password_hash"] = make_password(get_random_string(20))
         return super().create(validated_data)
 
 
