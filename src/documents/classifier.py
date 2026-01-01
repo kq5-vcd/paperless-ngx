@@ -329,7 +329,7 @@ class DocumentClassifier:
         # reduction (SVD, hashing) before DP training.
         use_dp = True  # or get from config
         dp_params = dict(
-            hidden_sizes=(512,), epochs=15, batch_size=64, lr=1e-3,
+            hidden_sizes=(512,), epochs=15, batch_size=20, lr=1e-3,
             max_grad_norm=1.0, noise_multiplier=1.1, verbose=True
         )
 
