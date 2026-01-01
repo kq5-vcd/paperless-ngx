@@ -43,6 +43,8 @@ except Exception as e:
 
 logger = logging.getLogger("paperless.classifier")
 
+USE_DP = True
+
 ADVANCED_TEXT_PROCESSING_ENABLED = (
     settings.NLTK_LANGUAGE is not None and settings.NLTK_ENABLED
 )
@@ -327,7 +329,7 @@ class DocumentClassifier:
         # sparse bag-of-words to dense tensors (or using embedding tricks). For moderate
         # vocab sizes this is fine; for very large vocab you may need dimensionality
         # reduction (SVD, hashing) before DP training.
-        use_dp = True  # or get from config
+        use_dp = USE_DP  # or get from config
         dp_params = dict(
             hidden_sizes=(512,), epochs=15, batch_size=20, lr=1e-3,
             max_grad_norm=1.0, noise_multiplier=1.1, verbose=True
@@ -659,6 +661,9 @@ def _train_with_dp_torch(
      - threshold (for multi-label inference): 0.5 default (you may tune)
      converts the sparse data_vectorized to a dense float32 tensor,
     """
+    if not USE_DP:
+        raise RuntimeError("Differential privacy is disabled.")
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
