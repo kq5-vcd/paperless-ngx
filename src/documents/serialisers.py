@@ -2130,10 +2130,15 @@ class ShareLinkSerializer(OwnedObjectSerializer):
         )
 
     def create(self, validated_data):
-        validated_data["slug"] = get_random_string(50)
-        if validated_data["protect_link_with_password"]:
-            validated_data["password_hash"] = make_password(get_random_string(20))
-        return super().create(validated_data)
+        if validated_data.get("document").contains_PII:  # ADDED
+            raise serializers.ValidationError(  # Return an error if the document is flagged as containing PII
+                "Cannot create share link for document flagged as containing PII.",
+            )
+        else:
+            validated_data["slug"] = get_random_string(50)
+            if validated_data["protect_link_with_password"]:
+                validated_data["password_hash"] = make_password(get_random_string(20))
+            return super().create(validated_data)
 
 
 class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):

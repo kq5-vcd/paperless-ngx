@@ -295,6 +295,16 @@ class Document(SoftDeleteModel, ModelWithOwner):
         help_text=_("The original name of the file when it was uploaded"),
     )
 
+    contains_PII = models.BooleanField(
+        _("contains PII"),
+        default=False,  # Default to False
+        blank=True,  # Allow blank values
+        null=True,  # Allow null values
+        help_text=_(
+            "Indicates whether the document contains Personally Identifiable Information (PII).",
+        ),
+    )
+
     ARCHIVE_SERIAL_NUMBER_MIN: Final[int] = 0
     ARCHIVE_SERIAL_NUMBER_MAX: Final[int] = 0xFF_FF_FF_FF
 
