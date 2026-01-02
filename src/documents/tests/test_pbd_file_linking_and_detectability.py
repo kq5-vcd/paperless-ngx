@@ -12,8 +12,6 @@ from rest_framework.test import APITestCase
 from documents.models import Document
 from documents.tests.utils import DirectoriesMixin
 
-# pytestmark = pytest.mark.django_db
-
 
 @override_settings(
     CELERY_TASK_ALWAYS_EAGER=True,
@@ -109,7 +107,7 @@ class TestFileLinkingAndDetectability(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
         returned_doc_2 = Document.objects.get(id=doc_id)
-        self.assertIsNotNone(returned_doc_2)
+        self.assertIsNone(returned_doc_2, "File should be deleted if owner is removed.")
 
     def test_link_id_through_file_history(self):
         """
@@ -157,7 +155,11 @@ class TestFileLinkingAndDetectability(DirectoriesMixin, APITestCase):
         self.assertIsNone(returned_doc_2.owner_id)
 
         owner_id_2 = self.get_owner_id_from_doc_history(doc_id)
-        self.assertEqual(returned_doc.owner_id, owner_id_2)
+        self.assertNotEqual(
+            returned_doc.owner_id,
+            owner_id_2,
+            "Owner ID must not appear after account is deleted.",
+        )
 
 
-# pytest --capture=no -n0 documents/tests/file_linking_and_detectability.py
+# pytest --capture=no -n0 documents/tests/test_pbd_file_linking_and_detectability.py
