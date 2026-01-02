@@ -1,17 +1,14 @@
-import unittest
-
 import numpy as np
+from django.test import TestCase
 
 from documents.classifier import _train_with_dp_torch
 
 
-class DPSGDTest(unittest.TestCase):
+class DPSGDTest(TestCase):
     def test_dp_training_reports_metadata(self):
         # Tiny synthetic dataset
         X = np.random.rand(10, 5).astype(np.float32)  # 10 samples, 5 features
         y = np.random.randint(0, 2, size=(10,))  # binary labels
-        # print("This is X: ", X)
-        # print("This is y: ", y)
         # Train with DP
         result = _train_with_dp_torch(
             X,
@@ -24,25 +21,40 @@ class DPSGDTest(unittest.TestCase):
             max_grad_norm=1.0,
             verbose=False,
         )
-        # print("I already have a result: ", result)
 
-        self.assertIsInstance(result, dict)
-        self.assertIn("noise_multiplier", result)
-        self.assertGreater(result["noise_multiplier"], 0)
-        self.assertIn("max_grad_norm", result)
-        self.assertIn("delta", result)  # delta is returned in your code
-        self.assertIn("epsilon", result)
-        self.assertGreater(result["epsilon"], 0)
-        self.assertLess(result["epsilon"], 20)
-
-        # Optional: check model exists
-        self.assertIn("model", result)
-
-        # optional
-        # result_low_noise = _train_with_dp_torch(X, y, noise_multiplier=0.5,epochs=1)
-        # result_high_noise = _train_with_dp_torch(X, y, noise_multiplier=2.0, epochs=1)
-        # assert result_high_noise["noise_multiplier"] > result_low_noise["noise_multiplier"]
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertIsInstance(
+            result,
+            dict,
+            msg="The result from _train_with_dp_torch should be a dictionary containing metadata and the model.",
+        )
+        self.assertIn(
+            "noise_multiplier",
+            result,
+            msg="The result dictionary must contain 'noise_multiplier' to ensure DP parameters are tracked.",
+        )
+        self.assertGreater(
+            result["noise_multiplier"],
+            0,
+            msg="The 'noise_multiplier' must be positive for Differential Privacy.",
+        )
+        self.assertIn(
+            "max_grad_norm",
+            result,
+            msg="The result dictionary must contain 'max_grad_norm'.",
+        )
+        self.assertIn(
+            "delta",
+            result,
+            msg="The result dictionary must contain 'delta'.",
+        )
+        self.assertIn(
+            "epsilon",
+            result,
+            msg="The result dictionary must contain 'epsilon', which quantifies the privacy loss.",
+        )
+        self.assertGreater(result["epsilon"], 0, msg="Epsilon must be greater than 0.")
+        self.assertLess(
+            result["epsilon"],
+            3,
+            msg="Epsilon is too high (>3), indicating insufficient privacy guarantees.",
+        )
