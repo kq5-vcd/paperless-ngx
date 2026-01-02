@@ -14,9 +14,17 @@ if TYPE_CHECKING:
 
     from numpy import ndarray
 
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from django.conf import settings
 from django.core.cache import cache
 from django.core.cache import caches
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.preprocessing import MultiLabelBinarizer
 
 from documents.caching import CACHE_5_MINUTES
 from documents.caching import CACHE_50_MINUTES
@@ -27,21 +35,14 @@ from documents.caching import StoredLRUCache
 from documents.models import Document
 from documents.models import MatchingModel
 
-import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.neural_network import MLPClassifier
-from sklearn.preprocessing import LabelBinarizer
-from sklearn.preprocessing import MultiLabelBinarizer
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
 try:
     from opacus import PrivacyEngine
-except Exception as e:
+except Exception:
     PrivacyEngine = None
 
 logger = logging.getLogger("paperless.classifier")
+
+USE_DP = True
 
 ADVANCED_TEXT_PROCESSING_ENABLED = (
     settings.NLTK_LANGUAGE is not None and settings.NLTK_ENABLED
@@ -315,7 +316,7 @@ class DocumentClassifier:
 
         data_vectorized: ndarray = self.data_vectorizer.fit_transform(
             content_generator(),
-        ) # if vocab > ~50k this may be heavy for SGD
+        )  # if vocab > ~50k this may be heavy for SGD
 
         # See the notes here:
         # https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.CountVectorizer.html
@@ -327,10 +328,15 @@ class DocumentClassifier:
         # sparse bag-of-words to dense tensors (or using embedding tricks). For moderate
         # vocab sizes this is fine; for very large vocab you may need dimensionality
         # reduction (SVD, hashing) before DP training.
-        use_dp = True  # or get from config
+        use_dp = USE_DP  # or get from config
         dp_params = dict(
-            hidden_sizes=(512,), epochs=15, batch_size=64, lr=1e-3,
-            max_grad_norm=1.0, noise_multiplier=1.1, verbose=True
+            hidden_sizes=(512,),
+            epochs=15,
+            batch_size=20,
+            lr=1e-3,
+            max_grad_norm=1.0,
+            noise_multiplier=1.1,
+            verbose=True,
         )
 
         if num_tags > 0:
@@ -376,7 +382,7 @@ class DocumentClassifier:
                     data_vectorized,
                     labels_correspondent,
                     multi_label=False,
-                    **dp_params
+                    **dp_params,
                 )
                 self.correspondent_classifier = dp_result
             else:
@@ -398,7 +404,7 @@ class DocumentClassifier:
                     data_vectorized,
                     labels_document_type,
                     multi_label=False,
-                    **dp_params
+                    **dp_params,
                 )
                 self.document_type_classifier = dp_result
             else:
@@ -420,13 +426,13 @@ class DocumentClassifier:
                     data_vectorized,
                     labels_storage_path,
                     multi_label=False,
-                    **dp_params
+                    **dp_params,
                 )
                 self.storage_path_classifier = dp_result
             else:
                 # sklearning training
                 self.storage_path_classifier = MLPClassifier(tol=0.01)
-                self.storage_path_classifier.fit(data_vectorized,labels_storage_path)
+                self.storage_path_classifier.fit(data_vectorized, labels_storage_path)
         else:
             self.storage_path_classifier = None
             logger.debug(
@@ -634,6 +640,7 @@ class SmallMLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 # DP training helper
 def _train_with_dp_torch(
     X_sparse,  # scipy sparse matrix (N x D)
@@ -642,10 +649,10 @@ def _train_with_dp_torch(
     multi_label=False,
     hidden_sizes=(512,),
     epochs=10,
-    batch_size=64, # Smaller batch_size increases privacy accounting sample rate; Opacus requires that sample_rate = batch_size / N be consistent
+    batch_size=64,  # Smaller batch_size increases privacy accounting sample rate; Opacus requires that sample_rate = batch_size / N be consistent
     lr=1e-3,
-    max_grad_norm=1.0, # gradient clipping
-    noise_multiplier=2, # more privacy (smaller ε) but worse accuracy
+    max_grad_norm=1.0,  # gradient clipping
+    noise_multiplier=2,  # more privacy (smaller ε) but worse accuracy
     delta=None,
     verbose=False,
     device=None,
@@ -659,12 +666,15 @@ def _train_with_dp_torch(
      - threshold (for multi-label inference): 0.5 default (you may tune)
      converts the sparse data_vectorized to a dense float32 tensor,
     """
+    if not USE_DP:
+        raise RuntimeError("Differential privacy is disabled.")
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if PrivacyEngine is None:
         raise RuntimeError(
-            "Opacus not available. Install with `pip install opacus` to use DP training."
+            "Opacus not available. Install with `pip install opacus` to use DP training.",
         )
 
     # Convert X to dense (float32). If X is sparse, densify carefully.
@@ -679,7 +689,9 @@ def _train_with_dp_torch(
     # Prepare targets
     if multi_label:
         # y should be a binary matrix (N x C); if currently list-of-lists, convert
-        if isinstance(y, (list, tuple)) and (len(y) == N and not isinstance(y[0], (np.ndarray, list))):
+        if isinstance(y, (list, tuple)) and (
+            len(y) == N and not isinstance(y[0], (np.ndarray, list))
+        ):
             # list of lists of labels -> MultiLabelBinarizer style conversion
             # Build global label set
             all_labels = sorted({lab for row in y for lab in row})
@@ -722,16 +734,17 @@ def _train_with_dp_torch(
     # Setup Opacus PrivacyEngine
     # If delta not set, use 1 / (N ** 1.1) as heuristic (you can set it externally)
     if delta is None:
-        delta = 1.0 / (N ** 1.1)
+        delta = 1.0 / (N**1.1)
 
     privacy_engine = PrivacyEngine()
-    model, optimizer, dataloader = None, None, None
+    # model, optimizer, dataloader = None, None, None
 
     # Build a DataLoader for per-sample gradients: we must pass sample_rate or batch_size.
-    from torch.utils.data import TensorDataset, DataLoader
+    from torch.utils.data import DataLoader
+    from torch.utils.data import TensorDataset
 
     dataset = TensorDataset(X_tensor, y_tensor)
-    sample_rate = float(batch_size) / float(N)
+    # sample_rate = float(batch_size) / float(N)
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
@@ -768,7 +781,9 @@ def _train_with_dp_torch(
         if verbose:
             # Get current epsilon spent
             epsilon = privacy_engine.get_epsilon(delta)
-            print(f"Epoch {epoch+1}/{epochs} loss={running_loss:.4f} eps≈{epsilon:.2f}")
+            # print(
+            #     f"Epoch {epoch + 1}/{epochs} loss={running_loss:.4f} eps≈{epsilon:.2f}",
+            # )
 
     epsilon = privacy_engine.get_epsilon(delta)
     res = {
@@ -784,6 +799,7 @@ def _train_with_dp_torch(
     }
     return res
 
+
 # Utility: inference helper for the returned dict
 def _dp_predict(result_dict, X_sparse, device=None):
     model = result_dict["model"]
@@ -798,7 +814,7 @@ def _dp_predict(result_dict, X_sparse, device=None):
     if result_dict["is_multi_label"]:
         logits = out.numpy()
         probs = 1.0 / (1.0 + np.exp(-logits))
-        chosen = (probs >= result_dict.get("threshold", 0.5))
+        chosen = probs >= result_dict.get("threshold", 0.5)
         # map back indices to labels
         inv = result_dict["inv_label_map"]
         results = []
