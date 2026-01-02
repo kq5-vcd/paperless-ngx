@@ -27,8 +27,3 @@ class DPSGDTest(TestCase):
         self.assertIn("epsilon", result, msg="The result dictionary must contain 'epsilon', which quantifies the privacy loss.")
         self.assertGreater(result["epsilon"], 0, msg="Epsilon must be greater than 0.")
         self.assertLess(result["epsilon"], 3, msg="Epsilon is too high (>3), indicating insufficient privacy guarantees.")
-
-        # delta <= 1 / n_samples (dataset size)
-
-        # Optional: check model exists
-        #self.assertIn("model", result, msg="The trained PyTorch model must be returned in the result dictionary.")
