@@ -433,6 +433,122 @@ class TestShareLinkPasswordProtection(DirectoriesMixin, TestCase):
         )
 
 
+class TestShareLinkFlagPII(DirectoriesMixin, TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user("testuser")
+        super().setUp()
+
+    def test_PII_flag_set(self):
+        """
+        GIVEN:
+            - PII flag set on document
+        WHEN:
+            - Request for share link creation is made
+        THEN:
+            - Share link creation is blocked
+        """
+        _, filename = tempfile.mkstemp(dir=self.dirs.originals_dir)
+
+        content = b"This is a test"
+        with Path(filename).open("wb") as f:
+            f.write(content)
+
+        doc = Document.objects.create(
+            title="none",
+            filename=Path(filename).name,
+            mime_type="application/pdf",
+            contains_PII=True,
+        )
+
+        sharelink_permissions = Permission.objects.filter(
+            codename__contains="sharelink",
+        )
+        self.user.user_permissions.add(*sharelink_permissions)
+        self.user.save()
+
+        self.client.force_login(self.user)
+
+        response = self.client.post(  # Create share link for the document
+            "/api/share_links/",
+            {
+                "document": doc.pk,
+                "file_version": "original",
+                "max_access_count": 3,
+            },
+            follow=True,
+        )
+
+        self.client.logout()
+
+        # Check that no share link was created
+        self.assertFalse(
+            ShareLink.objects.filter(document=doc).exists(),
+            msg="No share link should be created for documents flagged as containing PII",
+        )
+
+        # Check that share link creation is blocked due to PII flag
+        self.assertContains(
+            response,
+            b"Cannot create share link for document flagged as containing PII.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            msg_prefix="Share link creation should be blocked for documents flagged as containing PII",
+        )
+
+    def test_PII_flag_not_set(self):
+        """
+        GIVEN:
+            - PII flag not set on document
+        WHEN:
+            - Request for share link creation is made
+        THEN:
+            - Share link is created successfully
+        """
+        _, filename = tempfile.mkstemp(dir=self.dirs.originals_dir)
+
+        content = b"This is a test"
+        with Path(filename).open("wb") as f:
+            f.write(content)
+
+        doc = Document.objects.create(
+            title="none",
+            filename=Path(filename).name,
+            mime_type="application/pdf",
+            contains_PII=False,
+        )
+
+        sharelink_permissions = Permission.objects.filter(
+            codename__contains="sharelink",
+        )
+        self.user.user_permissions.add(*sharelink_permissions)
+        self.user.save()
+
+        self.client.force_login(self.user)
+
+        response = self.client.post(  # Create share link for the document
+            "/api/share_links/",
+            {
+                "document": doc.pk,
+                "file_version": "original",
+                "max_access_count": 3,
+            },
+        )
+
+        self.client.logout()
+
+        # Check that share link was created
+        self.assertTrue(
+            ShareLink.objects.filter(document=doc).exists(),
+            msg="Share link should be created for documents not flagged as containing PII",
+        )
+
+        # Check that share link creation was successful
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+            msg="Share link should be created successfully for documents not flagged as containing PII",
+        )
+
+
 class TestShareLink(DirectoriesMixin, TestCase):
     """Combined share link tests"""
 
