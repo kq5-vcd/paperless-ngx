@@ -212,7 +212,7 @@ class Document(SoftDeleteModel, ModelWithOwner):
         _("checksum"),
         max_length=32,
         editable=False,
-        unique=True,
+        db_index=True,
         help_text=_("The checksum of the original document."),
     )
 
@@ -293,6 +293,16 @@ class Document(SoftDeleteModel, ModelWithOwner):
         unique=False,
         null=True,
         help_text=_("The original name of the file when it was uploaded"),
+    )
+
+    contains_PII = models.BooleanField(
+        _("contains PII"),
+        default=False,  # Default to False
+        blank=True,  # Allow blank values
+        null=True,  # Allow null values
+        help_text=_(
+            "Indicates whether the document contains Personally Identifiable Information (PII).",
+        ),
     )
 
     ARCHIVE_SERIAL_NUMBER_MIN: Final[int] = 0
